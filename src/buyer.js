@@ -3,22 +3,18 @@
  * 
  * Autonomous buyer that:
  * - Browses listings
- * - Bids strategically (start low, increment)
+ * - Uses LLM to decide negotiation strategy (or falls back to heuristic)
  * - Knows its own budget cap
  * - Uses ERC-8004 identity to get reputation discounts
  */
 
 import { SELLER_PORT, BUYER_PORT } from './config.js'
+import { generateNegotiationStrategy } from './llm-utils.js'
 
 const SELLER = `http://localhost:${SELLER_PORT}`
 
 /**
- * Core negotiation logic — the "brain" (OpenClaw powers this in the full stack)
- * 
- * Strategy:
- * - Start at 60% of base price
- * - Increment by 10% each round
- * - Walk away if counter > budget
+ * Core negotiation logic — LLM-powered with heuristic fallback
  */
 async function negotiate({
   itemId,
@@ -38,13 +34,58 @@ async function negotiate({
   console.log(`📋 Listing: "${listing.name}" — base price: ${listing.basePrice / 1e6} USDC`)
 
   const basePrice = listing.basePrice
-  let offer = Math.floor(basePrice * 0.6)  // start at 60%
+  const maxRounds = 5
+  let offer = null
+  let lastCounter = null
   let round = 0
 
-  while (round < 5) {
+  while (round < maxRounds) {
     round++
-    console.log(`\n💬 Round ${round}: Offering ${offer / 1e6} USDC...`)
 
+    // ── LLM Strategy (or heuristic fallback) ─────────────────
+    let strategy
+    if (process.env.GOOGLE_API_KEY) {
+      try {
+        strategy = await generateNegotiationStrategy({
+          productName: listing.name,
+          basePrice,
+          minPrice: listing.minPrice || Math.floor(basePrice * 0.6),
+          budget,
+          currentOffer: offer,
+          sellerCounter: lastCounter,
+          round,
+          maxRounds,
+          reputationTier: mockReputation,
+        })
+        console.log(`\n🧠 LLM Strategy (Round ${round}): ${strategy.reasoning}`)
+
+        // If LLM says accept the counter and counter is within budget
+        if (strategy.shouldAcceptCounter && lastCounter && lastCounter <= budget) {
+          offer = lastCounter
+          console.log(`💬 Round ${round}: Accepting counter at ${offer / 1e6} USDC`)
+        } else {
+          offer = Math.min(strategy.nextOffer, budget)
+          console.log(`💬 Round ${round}: Offering ${offer / 1e6} USDC`)
+        }
+      } catch (err) {
+        console.warn(`[buyer] LLM strategy failed, using heuristic: ${err.message}`)
+        strategy = null
+      }
+    }
+
+    // Heuristic fallback
+    if (!strategy) {
+      if (!offer) {
+        offer = Math.floor(basePrice * 0.6) // start at 60%
+      } else if (lastCounter && lastCounter <= budget) {
+        offer = lastCounter // accept counter if within budget
+      } else {
+        offer = Math.min(Math.floor(offer * 1.1), budget) // increment 10%
+      }
+      console.log(`\n💬 Round ${round} (heuristic): Offering ${offer / 1e6} USDC...`)
+    }
+
+    // ── Send offer to seller ─────────────────────────────────
     const response = await fetch(`${SELLER}/negotiate/${itemId}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-From-Address': fromAddress },
@@ -60,31 +101,15 @@ async function negotiate({
 
     if (data.result === 'rejected') {
       console.log(`❌ Rejected: ${data.reason}`)
-      console.log(`   Walk-away. Min was ${data.minPrice / 1e6} USDC.`)
       return { result: 'failed', reason: 'price too low', minPrice: data.minPrice }
     }
 
     if (data.result === 'accepted') {
-      // Seller accepted! We get HTTP 402 with payment details
       console.log(`\n✅ DEAL! Seller accepted ${offer / 1e6} USDC`)
       if (data.reputationTier !== 'unknown') {
         console.log(`🌟 Reputation bonus: ${data.discountApplied}% off (${data.reputationTier} buyer)`)
       }
       console.log(`📨 Seller says: "${data.message}"`)
-      console.log()
-      console.log(`💳 x402 Payment Required:`)
-      console.log(`   Order ID:     ${data.orderId}`)
-      console.log(`   Pay to:       ${data.payToAddress}`)
-      console.log(`   Amount:       ${data.amountUsdc} USDC`)
-      console.log(`   Chain:        ${data.chainId}`)
-      console.log()
-      console.log(`   To pay (cast):`)
-      console.log(`   cast send 0x29d1ee93e9ecf6e50f309f498e40a6b42d352fa1 \\`)
-      console.log(`     "transfer(address,uint256)" ${data.payToAddress} ${data.amountWei} \\`)
-      console.log(`     --rpc-url https://rpc.testnet3.goat.network \\`)
-      console.log(`     --priority-gas-price 130000 --gas-price 1000000 \\`)
-      console.log(`     --private-key $BUYER_PK`)
-      console.log()
 
       return {
         result: 'accepted',
@@ -99,17 +124,11 @@ async function negotiate({
     if (data.result === 'counter') {
       console.log(`🔄 Counter-offer: ${data.counterOfferUsdc} USDC`)
       console.log(`   Seller: "${data.message}"`)
+      lastCounter = data.counterOffer
 
       if (data.counterOffer > budget) {
         console.log(`\n🚶 Walk away — counter ${data.counterOfferUsdc} USDC exceeds budget ${budget / 1e6} USDC`)
         return { result: 'failed', reason: 'exceeds budget', counterOffer: data.counterOffer }
-      }
-
-      // Accept if counter is within budget; else increment our offer
-      if (data.counterOffer <= budget) {
-        offer = data.counterOffer  // meet seller's counter if within budget
-      } else {
-        offer = Math.min(Math.floor(offer * 1.1), budget)  // increment 10%
       }
     }
   }
@@ -131,3 +150,4 @@ if (process.argv[1].includes('buyer.js')) {
     })
     .catch(console.error)
 }
+

@@ -10,7 +10,7 @@ import { addProduct, getProduct, getAllProducts, searchProducts, updateProductSt
 import { analyzeProduct, generateSellerResponse } from './ai-analyzer.js'
 import { getReputation, mockReputation } from './reputation.js'
 import { negotiate as runNegotiation } from './buyer.js'
-import { generateAgentChat } from './llm-utils.js'
+import { generateAgentChat, generateSellerChat, generateBuyerChat } from './llm-utils.js'
 
 const router = Router()
 
@@ -146,43 +146,107 @@ router.post('/seller/chat', async (req, res) => {
 
   let response
 
-  // If LLM available, use it for conversational nuance
-  if (process.env.GOOGLE_API_KEY && session.step !== 'greeting' && session.step !== 'confirm_listing') {
+  // ── LLM-Driven Seller Agent ────────────────────────────────
+  if (process.env.GOOGLE_API_KEY) {
     try {
-      const llmResponse = await generateAgentChat({
-        role: 'selling',
-        context: { step: session.step, ...session.data },
+      const llmResult = await generateSellerChat({
+        step: session.step,
+        sessionData: session.data,
         message,
-        history
+        history,
+        hasPhoto: !!photo,
       })
-      history.push({ role: 'user', text: message })
-      history.push({ role: 'assistant', text: llmResponse })
 
-      // Basic step progression based on keywords in LLM response or message
-      // Note: In a production app, we might use LLM tool calling here.
-      if (session.step === 'awaiting_product' && (message.length > 10 || photo)) {
-         const analysis = await analyzeProduct(message, photo || null)
-         session.data.description = message
-         session.data.analysis = analysis
-         session.data.name = analysis.name || extractProductName(message)
-         session.step = 'confirm_listing'
-         
-         // Inject the formal analysis into the LLM context for next message
-         const resp = generateSellerResponse(analysis, session.data.name)
-         response = { message: resp.message, analysis: resp.analysis, step: 'confirm_listing' }
-         sellerConversations.set(sessionId, session)
-         return res.json(response)
+      history.push({ role: 'user', text: message })
+      history.push({ role: 'assistant', text: llmResult.message })
+
+      const action = llmResult.action || 'chat'
+      console.log(`[seller-llm] Action: ${action}`)
+
+      switch (action) {
+        case 'greet':
+          session.step = 'awaiting_product'
+          response = { message: llmResult.message, step: 'awaiting_product' }
+          break
+
+        case 'analyze_product': {
+          const analysis = await analyzeProduct(message, photo || null)
+          session.data.description = message
+          session.data.analysis = analysis
+          session.data.name = analysis.name || extractProductName(message)
+          session.step = 'confirm_listing'
+
+          const resp = generateSellerResponse(analysis, session.data.name)
+          response = { message: resp.message, analysis: resp.analysis, step: 'confirm_listing' }
+          break
+        }
+
+        case 'list_product': {
+          if (!session.data.analysis) {
+            response = { message: llmResult.message || 'Please describe your product first!', step: session.step }
+            break
+          }
+          const product = addProduct({
+            name: session.data.name,
+            description: session.data.description,
+            category: session.data.analysis.category,
+            condition: session.data.analysis.condition,
+            photos: photo ? [photo] : [],
+            basePrice: session.data.analysis.suggestedPrice,
+            minPrice: session.data.analysis.minPrice,
+            sellerId: sessionId,
+            aiAnalysis: session.data.analysis,
+          })
+
+          response = {
+            message: `🎉 Your product is now live on Quickash!\n\n` +
+                     `📦 **${product.name}**\n` +
+                     `💰 Listed at **${product.basePrice / 1e6} USDC**\n` +
+                     `🆔 Product ID: ${product.id}\n\n` +
+                     `Buyers can now see and negotiate for your item!\n\nWant to list another product?`,
+            product: { ...product, basePriceUsdc: product.basePrice / 1e6 },
+            step: 'awaiting_product',
+          }
+          session.step = 'awaiting_product'
+          session.data = {}
+          chatHistories.set(sessionId, [])
+          break
+        }
+
+        case 'adjust_price': {
+          const newPrice = llmResult.price
+          if (newPrice && session.data.analysis) {
+            session.data.analysis.suggestedPrice = newPrice * 1e6
+            session.data.analysis.minPrice = Math.floor(newPrice * 1e6 * 0.6)
+            session.data.analysis.suggestedPriceUsdc = newPrice
+            session.data.analysis.minPriceUsdc = session.data.analysis.minPrice / 1e6
+          }
+          response = { message: llmResult.message, step: 'confirm_listing' }
+          break
+        }
+
+        case 'ask_price':
+          response = { message: llmResult.message, step: 'confirm_listing' }
+          break
+
+        case 'cancel':
+          session.step = 'awaiting_product'
+          session.data = {}
+          response = { message: llmResult.message, step: 'awaiting_product' }
+          break
+
+        default:
+          response = { message: llmResult.message, step: session.step }
       }
 
-      response = { message: llmResponse, step: session.step }
       sellerConversations.set(sessionId, session)
       return res.json(response)
     } catch (err) {
-      console.warn('[api] LLM chat failed, falling back to static:', err.message)
+      console.warn('[api] Seller LLM failed, falling back to heuristic:', err.message)
     }
   }
 
-  // Fallback to static logic
+  // ── Heuristic Fallback (no API key) ────────────────────────
   switch (session.step) {
     case 'greeting':
       response = {
@@ -199,11 +263,7 @@ router.post('/seller/chat', async (req, res) => {
       session.data.name = analysis.name || extractProductName(message)
 
       const resp = generateSellerResponse(analysis, session.data.name)
-      response = {
-        message: resp.message,
-        analysis: resp.analysis,
-        step: 'confirm_listing',
-      }
+      response = { message: resp.message, analysis: resp.analysis, step: 'confirm_listing' }
       session.step = 'confirm_listing'
       break
     }
@@ -211,7 +271,6 @@ router.post('/seller/chat', async (req, res) => {
     case 'confirm_listing': {
       const msg = message.toLowerCase()
       if (msg.includes('yes') || msg.includes('list') || msg.includes('confirm') || msg.includes('ok') || msg.includes('sure')) {
-        // Create the listing
         const product = addProduct({
           name: session.data.name,
           description: session.data.description,
@@ -229,14 +288,13 @@ router.post('/seller/chat', async (req, res) => {
                    `📦 **${product.name}**\n` +
                    `💰 Listed at **${product.basePrice / 1e6} USDC**\n` +
                    `🆔 Product ID: ${product.id}\n\n` +
-                   `Buyers can now see and negotiate for your item. I'll notify you when offers come in!\n\n` +
-                   `Want to list another product?`,
+                   `Buyers can now see and negotiate for your item!\n\nWant to list another product?`,
           product: { ...product, basePriceUsdc: product.basePrice / 1e6 },
           step: 'awaiting_product',
         }
         session.step = 'awaiting_product'
         session.data = {}
-        chatHistories.set(sessionId, []) // Reset history after listing
+        chatHistories.set(sessionId, [])
       } else if (msg.includes('price') || msg.includes('change') || msg.includes('adjust')) {
         const priceMatch = msg.match(/(\d+(?:\.\d+)?)/);
         if (priceMatch) {
@@ -244,34 +302,25 @@ router.post('/seller/chat', async (req, res) => {
           session.data.analysis.minPrice = Math.floor(session.data.analysis.suggestedPrice * 0.6)
           session.data.analysis.suggestedPriceUsdc = parseFloat(priceMatch[1])
           session.data.analysis.minPriceUsdc = session.data.analysis.minPrice / 1e6
-          response = {
-            message: `Got it! Updated the price to **${parseFloat(priceMatch[1])} USDC**.\n\nShall I list it now?`,
-            step: 'confirm_listing',
-          }
+          response = { message: `Got it! Updated the price to **${parseFloat(priceMatch[1])} USDC**.\n\nShall I list it now?`, step: 'confirm_listing' }
         } else {
-          response = {
-            message: `What price would you like? Just tell me a number (e.g., "make it 50 USDC").`,
-            step: 'confirm_listing',
-          }
+          response = { message: `What price would you like? Just tell me a number (e.g., "make it 50 USDC").`, step: 'confirm_listing' }
         }
       } else {
-        response = {
-          message: `Just say **"yes"** to list it, or tell me if you'd like to adjust the price.`,
-          step: 'confirm_listing',
-        }
+        response = { message: `Just say **"yes"** to list it, or tell me if you'd like to adjust the price.`, step: 'confirm_listing' }
       }
       break
     }
 
     default:
-      session.step = 'greeting'
-      response = { message: `Let's start fresh! Tell me about the product you want to sell.`, step: 'awaiting_product' }
       session.step = 'awaiting_product'
+      response = { message: `Let's start fresh! Tell me about the product you want to sell.`, step: 'awaiting_product' }
   }
 
   sellerConversations.set(sessionId, session)
   res.json(response)
 })
+
 
 // ── Buyer Chat ───────────────────────────────────────────────
 
@@ -287,54 +336,136 @@ router.post('/buyer/chat', async (req, res) => {
 
   let response
 
-  // If LLM available
-  if (process.env.GOOGLE_API_KEY && session.step !== 'greeting') {
+  // ── LLM-Driven Buyer Agent ─────────────────────────────────
+  if (process.env.GOOGLE_API_KEY) {
     try {
-      const llmResponse = await generateAgentChat({
-        role: 'buying',
-        context: { step: session.step, ...session.data },
+      const allProducts = getAllProducts()
+      const llmResult = await generateBuyerChat({
+        step: session.step,
+        sessionData: session.data,
         message,
-        history
+        history,
+        availableProducts: allProducts,
       })
+
       history.push({ role: 'user', text: message })
-      history.push({ role: 'assistant', text: llmResponse })
+      history.push({ role: 'assistant', text: llmResult.message })
 
-      // Intelligent intent extraction
-      if (session.step === 'awaiting_request') {
-        const priceMatch = message.match(/(\d+(?:\.\d+)?)\s*(?:usdc|usd|\$|dollars|budget)/i) ||
-                           message.match(/(?:under|below|max|budget|spend)\s*\$?\s*(\d+(?:\.\d+)?)/i)
-        const budget = priceMatch ? parseFloat(priceMatch[1]) * 1e6 : session.data.budget
+      const action = llmResult.action || 'chat'
+      console.log(`[buyer-llm] Action: ${action}`)
 
-        const results = searchProducts({
-          query: message.replace(/\d+/g, '').trim(),
-          maxPrice: budget,
-        })
+      switch (action) {
+        case 'greet':
+          session.step = 'awaiting_request'
+          response = { message: llmResult.message, step: 'awaiting_request' }
+          break
 
-        if (results.length > 0) {
-          session.data.searchQuery = message
+        case 'search': {
+          const query = llmResult.searchQuery || message.replace(/\d+/g, '').trim()
+          const budget = llmResult.budget ? llmResult.budget * 1e6 : session.data.budget
+          const results = searchProducts({ query, maxPrice: budget })
+
+          session.data.searchQuery = query
           session.data.budget = budget
           session.data.results = results
-          session.step = 'select_product'
-          
-          response = {
-            message: llmResponse + `\n\n🔍 **Found ${results.length} matches!** Check them out below.`,
-            products: results.map(p => ({ ...p, basePriceUsdc: p.basePrice / 1e6 })),
-            step: 'select_product'
+
+          if (results.length === 0) {
+            response = {
+              message: llmResult.message + `\n\n😔 No matching products found. Try a broader search!`,
+              products: [],
+              step: 'awaiting_request',
+            }
+          } else {
+            session.step = 'select_product'
+            response = {
+              message: llmResult.message + `\n\n🔍 **Found ${results.length} matches!**`,
+              products: results.map(p => ({ ...p, basePriceUsdc: p.basePrice / 1e6 })),
+              step: 'select_product',
+            }
           }
-          buyerConversations.set(sessionId, session)
-          return res.json(response)
+          break
         }
+
+        case 'select_product': {
+          const results = session.data.results || allProducts
+          const idx = llmResult.productIndex
+          let selected = null
+
+          if (idx != null && idx >= 0 && idx < results.length) {
+            selected = results[idx]
+          }
+          if (!selected) {
+            // Try name matching as fallback
+            const msg = message.toLowerCase()
+            selected = results.find(p => p.name.toLowerCase().includes(msg))
+          }
+          if (!selected && results.length === 1) selected = results[0]
+
+          if (!selected) {
+            response = { message: llmResult.message || `I'm not sure which product you mean. Could you say the number or name?`, step: 'select_product' }
+            break
+          }
+
+          session.data.selectedProduct = selected
+          if (!session.data.budget) {
+            session.step = 'set_budget'
+            response = { message: llmResult.message || `Great! **${selected.name}** is ${selected.basePrice / 1e6} USDC. What's your max budget?`, step: 'set_budget' }
+          } else {
+            session.step = 'confirm_negotiate'
+            response = { message: llmResult.message || `🎯 Target: **${selected.name}**\n💰 Budget: **${session.data.budget / 1e6} USDC**\n\nReady to negotiate? Say **"go"**!`, step: 'confirm_negotiate' }
+          }
+          break
+        }
+
+        case 'set_budget': {
+          const budgetVal = llmResult.budget
+          if (budgetVal) {
+            session.data.budget = budgetVal * 1e6
+            session.step = 'confirm_negotiate'
+            response = { message: llmResult.message, step: 'confirm_negotiate' }
+          } else {
+            response = { message: llmResult.message || `Tell me your budget in USDC.`, step: 'set_budget' }
+          }
+          break
+        }
+
+        case 'start_negotiation': {
+          const product = session.data.selectedProduct
+          if (!product) {
+            response = { message: llmResult.message || `Please select a product first!`, step: session.step }
+            break
+          }
+          response = {
+            message: `🤖 Negotiating for **${product.name}**...`,
+            negotiating: true,
+            productId: product.id,
+            budget: session.data.budget,
+            step: 'negotiation_result',
+          }
+          session.step = 'awaiting_request'
+          session.data = {}
+          chatHistories.set(sessionId + '_buyer', [])
+          break
+        }
+
+        case 'new_search':
+          session.step = 'awaiting_request'
+          session.data = {}
+          response = { message: llmResult.message, step: 'awaiting_request' }
+          break
+
+        default:
+          response = { message: llmResult.message, step: session.step }
       }
 
-      response = { message: llmResponse, step: session.step }
       buyerConversations.set(sessionId, session)
       return res.json(response)
     } catch (err) {
-      console.warn('[api] Buyer LLM chat failed:', err.message)
+      console.warn('[api] Buyer LLM failed, falling back to heuristic:', err.message)
     }
   }
 
-  // Fallback
+  // ── Heuristic Fallback ─────────────────────────────────────
   switch (session.step) {
     case 'greeting':
       response = {
@@ -359,11 +490,7 @@ router.post('/buyer/chat', async (req, res) => {
       session.data.results = results
 
       if (results.length === 0) {
-        response = {
-          message: `😔 I couldn't find any matching products right now.\n\nTry a broader search, or check back later!`,
-          products: [],
-          step: 'awaiting_request',
-        }
+        response = { message: `😔 I couldn't find any matching products right now.\n\nTry a broader search, or check back later!`, products: [], step: 'awaiting_request' }
       } else {
         response = {
           message: `🔍 I found **${results.length}** matching products! Which one should I negotiate for?`,
@@ -438,13 +565,14 @@ router.post('/buyer/chat', async (req, res) => {
     }
 
     default:
-      session.step = 'greeting'
+      session.step = 'awaiting_request'
       response = { message: `Let's start fresh! What are you looking for?`, step: 'awaiting_request' }
   }
 
   buyerConversations.set(sessionId, session)
   res.json(response)
 })
+
 
 
 // ── Buyer Negotiate ──────────────────────────────────────────
