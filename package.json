@@ -1,19 +1,19 @@
 {
-  "name": "goat-haggler",
+  "name": "quickash",
   "version": "1.0.0",
-  "description": "🚀 AI Auto-Haggler — M2M marketplace where agents negotiate prices using ERC-8004 reputation + x402 payments",
+  "description": "🚀 Quickash — AI marketplace with agent negotiation and x402 payments",
   "type": "module",
   "scripts": {
     "seller": "node src/seller.js",
     "buyer": "node src/buyer.js",
-    "demo": "node src/demo.js"
+    "demo": "node src/demo.js",
+    "start": "node src/seller.js"
   },
   "dependencies": {
     "@google/generative-ai": "^0.24.1",
     "@supabase/supabase-js": "^2.99.1",
     "dotenv": "^16.3.3",
     "ethers": "^6.9.0",
-    "express": "^4.18.2",
-    "goatx402-sdk-server": "file:../goat-x402-src/goatx402-sdk-server-ts"
+    "express": "^4.18.2"
   }
 }

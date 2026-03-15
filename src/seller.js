@@ -246,14 +246,19 @@ app.post('/confirm/:orderId', async (req, res) => {
   }
 })
 
-// ── Start Server ─────────────────────────────────────────────
-app.listen(SELLER_PORT, () => {
-  console.log(`\n${'═'.repeat(55)}`)
-  console.log(`  🏪 Quickash — Secondhand Marketplace`)
-  console.log(`${'═'.repeat(55)}`)
-  console.log(`  🌐 Web UI:    http://localhost:${SELLER_PORT}`)
-  console.log(`  📡 API:       http://localhost:${SELLER_PORT}/api`)
-  console.log(`  📋 Listings:  http://localhost:${SELLER_PORT}/listings`)
-  console.log(`  ⛓️  Chain:     GOAT Testnet3 (${CHAIN_ID})`)
-  console.log(`${'═'.repeat(55)}\n`)
-})
+// ── Export App (for Vercel) ──────────────────────────────────
+export default app
+
+// ── Start Server (local only) ────────────────────────────────
+if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
+  app.listen(SELLER_PORT, () => {
+    console.log(`\n${'═'.repeat(55)}`)
+    console.log(`  🏪 Quickash — Secondhand Marketplace`)
+    console.log(`${'═'.repeat(55)}`)
+    console.log(`  🌐 Web UI:    http://localhost:${SELLER_PORT}`)
+    console.log(`  📡 API:       http://localhost:${SELLER_PORT}/api`)
+    console.log(`  📋 Listings:  http://localhost:${SELLER_PORT}/listings`)
+    console.log(`  ⛓️  Chain:     GOAT Testnet3 (${CHAIN_ID})`)
+    console.log(`${'═'.repeat(55)}\n`)
+  })
+}

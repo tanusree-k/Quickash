@@ -1,0 +1,21 @@
+{
+  "version": 2,
+  "rewrites": [
+    {
+      "source": "/api/:path*",
+      "destination": "/api/index.js"
+    },
+    {
+      "source": "/listings/:path*",
+      "destination": "/api/index.js"
+    },
+    {
+      "source": "/negotiate/:path*",
+      "destination": "/api/index.js"
+    },
+    {
+      "source": "/confirm/:path*",
+      "destination": "/api/index.js"
+    }
+  ]
+}
