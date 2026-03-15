@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Quickash — AI-powered secondhand marketplace. Sell your stuff, agents negotiate, payments settle on-chain.">
+  <title>Quickash — AI Secondhand Marketplace</title>
+  <link rel="stylesheet" href="styles.css">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="https://cdn.jsdelivr.net/npm/ethers@6/dist/ethers.umd.min.js"></script>
+</head>
+<body>
+  <!-- ── Login View (Overlay) ────────────────────────────── -->
+  <div id="view-login" class="login-overlay active">
+    <div class="login-card">
+      <div class="login-logo">
+        <img src="logo.png" alt="Quickash" />
+        <h2>Quick<span>ash</span></h2>
+      </div>
+      <p class="login-tagline">AI-Powered Secondhand Market</p>
+      
+      <div id="auth-form-container">
+        <div class="auth-tabs">
+          <button id="tab-login" class="auth-tab-btn active">Login</button>
+          <button id="tab-signup" class="auth-tab-btn">Sign Up</button>
+        </div>
+
+        <form id="auth-form" class="auth-form">
+          <div class="signup-only">
+            <div class="input-group">
+              <label for="auth-name">Full Name</label>
+              <input type="text" id="auth-name" placeholder="John Doe">
+            </div>
+            <div class="input-group">
+              <label for="auth-phone">Phone Number</label>
+              <input type="tel" id="auth-phone" placeholder="+91 98765 43210">
+            </div>
+            <div class="input-group">
+              <label for="auth-address">Default Delivery Address</label>
+              <input type="text" id="auth-address" placeholder="123, Main St, Bangalore">
+            </div>
+          </div>
+          <div class="input-group">
+            <label for="auth-email">Email Address</label>
+            <input type="email" id="auth-email" placeholder="name@company.com" required>
+          </div>
+          <div class="input-group">
+            <label for="auth-password">Password</label>
+            <input type="password" id="auth-password" placeholder="••••••••••••" required>
+          </div>
+          <button type="submit" id="auth-submit-btn" class="login-submit">Sign In to Quickash</button>
+        </form>
+      </div>
+
+      <div class="auth-divider"><span>Secure Access</span></div>
+
+      <button id="guest-login-btn" class="btn btn-secondary guest-btn">
+        Explore as Guest
+      </button>
+      
+      <p class="login-terms">Experience the future of commerce with AI agents and secure on-chain payments.</p>
+    </div>
+  </div>
+
+  <!-- ── Header ────────────────────────────────────────── -->
+  <header id="app-header">
+    <div class="header-left">
+      <h1 class="logo">
+        <img src="logo.png" alt="Quickash" class="logo-icon" />
+        <span>Quick<span class="logo-accent">ash</span></span>
+      </h1>
+      <span class="tagline">AI-Powered Secondhand Market</span>
+    </div>
+    <nav class="tab-bar" id="tab-bar">
+      <button class="tab active" data-tab="marketplace" id="tab-marketplace">
+        <span class="tab-icon">🏪</span> Marketplace
+      </button>
+      <button class="tab" data-tab="sell" id="tab-sell">
+        <span class="tab-icon">📸</span> Sell
+      </button>
+      <button class="tab" data-tab="buy" id="tab-buy">
+        <span class="tab-icon">🤖</span> Buy Agent
+      </button>
+    </nav>
+    <div class="header-right">
+      <button id="wallet-btn" class="wallet-btn" onclick="connectWallet()">
+        🦊 Connect Wallet
+      </button>
+      <div class="chain-badge" id="chain-badge">
+        <span class="chain-dot"></span>
+        GOAT Testnet3
+      </div>
+    </div>
+  </header>
+
+  <!-- ── Payment Modal ───────────────────────────────── -->
+  <div class="modal-overlay" id="payment-modal" style="display:none">
+    <div class="modal payment-modal">
+      <button class="modal-close" onclick="closePaymentModal()">✕</button>
+      <h3>💳 Confirm Payment</h3>
+      <div id="payment-details">
+        <div class="payment-row"><span>Product</span><strong id="pay-product"></strong></div>
+        <div class="payment-row"><span>Price</span><strong id="pay-amount"></strong></div>
+        <div class="payment-row"><span>Pay To</span><code id="pay-address"></code></div>
+        <div class="payment-row"><span>Chain</span><span>GOAT Testnet3</span></div>
+        <div class="payment-row"><span>Token</span><span>USDC</span></div>
+      </div>
+      <button id="pay-now-btn" class="btn btn-primary" onclick="executePayment()">
+        🦊 Pay with MetaMask
+      </button>
+      <p id="pay-status" class="pay-status"></p>
+    </div>
+  </div>
+
+  <!-- ── Delivery Modal ──────────────────────────────── -->
+  <div class="modal-overlay" id="delivery-modal" style="display:none">
+    <div class="modal delivery-modal">
+      <button class="modal-close" onclick="closeDeliveryModal()">✕</button>
+      <h3>📦 Delivery Details</h3>
+      <p id="delivery-product-name"></p>
+      <div class="delivery-options">
+        <button class="delivery-opt active" id="opt-ship" onclick="setDeliveryMode('ship')">🚚 Ship to Address</button>
+        <button class="delivery-opt" id="opt-pickup" onclick="setDeliveryMode('pickup')">📍 Pickup In Person</button>
+      </div>
+      <form id="delivery-form" class="auth-form">
+        <div id="ship-fields">
+          <div class="input-group">
+            <label>Full Name</label>
+            <input type="text" id="del-name" placeholder="Jane Doe" required>
+          </div>
+          <div class="input-group">
+            <label>Address</label>
+            <input type="text" id="del-address" placeholder="123 Main St" required>
+          </div>
+          <div class="input-group">
+            <label>City</label>
+            <input type="text" id="del-city" placeholder="Mumbai" required>
+          </div>
+          <div class="input-group">
+            <label>Pincode</label>
+            <input type="text" id="del-pincode" placeholder="400001" required>
+          </div>
+          <div class="input-group">
+            <label>Phone</label>
+            <input type="tel" id="del-phone" placeholder="+91 9876543210" required>
+          </div>
+        </div>
+        <div id="pickup-fields" style="display:none">
+          <div class="input-group">
+            <label>Your Name</label>
+            <input type="text" id="pickup-name" placeholder="Jane Doe">
+          </div>
+          <div class="input-group">
+            <label>Phone Number</label>
+            <input type="tel" id="pickup-phone" placeholder="+91 9876543210">
+          </div>
+          <p class="pickup-note">📍 The seller will share the pickup location after confirmation.</p>
+        </div>
+        <button type="submit" class="btn btn-primary">Confirm & Complete Order</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- ── Marketplace View ──────────────────────────────── -->
+  <main id="view-marketplace" class="view active">
+    <div class="view-header">
+      <h2>🏪 Marketplace</h2>
+      <div class="search-bar">
+        <input type="text" id="search-input" placeholder="Search products..." />
+        <select id="category-filter">
+          <option value="">All Categories</option>
+          <option value="electronics">Electronics</option>
+          <option value="fashion">Fashion</option>
+          <option value="furniture">Furniture</option>
+          <option value="gaming">Gaming</option>
+          <option value="sports">Sports</option>
+          <option value="books">Books</option>
+        </select>
+      </div>
+    </div>
+    <div class="product-grid" id="product-grid">
+      <!-- Products loaded dynamically -->
+    </div>
+    
+    <!-- Transaction Feed -->
+    <div class="tx-feed" id="tx-feed">
+      <h3>📊 Recent Transactions</h3>
+      <div class="tx-list" id="tx-list">
+        <div class="tx-empty">No transactions yet. Start buying!</div>
+      </div>
+    </div>
+  </main>
+
+  <!-- ── Sell View (Chat) ──────────────────────────────── -->
+  <main id="view-sell" class="view">
+    <div class="chat-container">
+      <div class="chat-header">
+        <div class="agent-avatar seller-avatar">🏪</div>
+        <div>
+          <h3>Seller Agent</h3>
+          <span class="agent-status">Ready to help you list products</span>
+        </div>
+      </div>
+      <div class="chat-messages" id="seller-messages">
+        <!-- Messages appear here -->
+      </div>
+      <div class="chat-input-area">
+        <input type="file" id="seller-image-input" accept="image/*" style="display: none;" />
+        <button class="icon-btn" id="seller-image-btn" title="Upload Photo">📷</button>
+        <input type="text" id="seller-input" placeholder="Describe your product or upload a photo..." />
+        <button class="send-btn" id="seller-send">Send ➤</button>
+      </div>
+    </div>
+  </main>
+
+  <!-- ── Buy View (Chat) ──────────────────────────────── -->
+  <main id="view-buy" class="view">
+    <div class="chat-container">
+      <div class="chat-header">
+        <div class="agent-avatar buyer-avatar">🤖</div>
+        <div>
+          <h3>Buyer Agent</h3>
+          <span class="agent-status">Ready to find and negotiate deals</span>
+        </div>
+      </div>
+      <div class="chat-messages" id="buyer-messages">
+        <!-- Messages appear here -->
+      </div>
+      <div class="chat-input-area">
+        <input type="text" id="buyer-input" placeholder="What are you looking for?" />
+        <button class="send-btn" id="buyer-send">Send ➤</button>
+      </div>
+    </div>
+  </main>
+
+  <!-- ── Product Detail Modal ──────────────────────────── -->
+  <div class="modal-overlay" id="product-modal" style="display:none">
+    <div class="modal">
+      <button class="modal-close" id="modal-close">✕</button>
+      <div class="modal-body" id="modal-body">
+        <!-- Product details -->
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

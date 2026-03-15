@@ -1,65 +1,63 @@
 /**
- * 🏪 Seller Agent
+ * 🏪 Seller Agent + Web Server
  * 
- * Sells digital assets (AI prompts, data, compute).
- * - Lists items with base prices
- * - Accepts negotiation offers via x402
- * - Checks buyer's ERC-8004 reputation
- * - Auto-discounts for trusted buyers
+ * Serves the Quickash marketplace:
+ * - Web UI (static files from /public)
+ * - REST API (/api/*)
+ * - Negotiation endpoints (/negotiate, /confirm)
+ * - Dynamic product catalogue from products.js
  */
 
 import express from 'express'
-import { GoatX402Client } from 'goatx402-sdk-server'
+import { fileURLToPath } from 'url'
+import { dirname, join } from 'path'
 import { CHAIN_ID, USDC, SELLER_PORT, seller as sellerCreds, ADMIN_URL } from './config.js'
 import { getReputation, mockReputation } from './reputation.js'
+import { getProduct, getAllProducts, seedDemoProducts, updateProductStatus } from './products.js'
+import apiRouter, { recordTransaction } from './api.js'
+
+import { X402Client } from './x402-client.js'
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = dirname(__filename)
 
 const app = express()
-app.use(express.json())
+app.use(express.json({ limit: '10mb' }))
 
-const x402 = new GoatX402Client({
-  baseUrl:   ADMIN_URL,
-  apiKey:    sellerCreds.apiKey,
-  apiSecret: sellerCreds.apiSecret,
-})
+// ── Serve static web UI ──────────────────────────────────────
+app.use(express.static(join(__dirname, '..', 'public')))
 
-// ── Catalogue ─────────────────────────────────────────────────
-const LISTINGS = {
-  'prompt-001': {
-    id: 'prompt-001',
-    name: 'GPT-4 Jailbreak Prompt v3',
-    description: 'Advanced system prompt for unrestricted outputs',
-    basePrice: 500000,   // 0.5 USDC
-    minPrice:  200000,   // 0.2 USDC (walk-away)
-    category: 'prompt',
-  },
-  'data-001': {
-    id: 'data-001',
-    name: 'Crypto Twitter Sentiment Dataset (7 days)',
-    description: '50k tweets, labeled, JSON format',
-    basePrice: 1000000,  // 1.0 USDC
-    minPrice:  600000,   // 0.6 USDC
-    category: 'data',
-  },
-  'compute-001': {
-    id: 'compute-001',
-    name: '1hr GPU Slot (A100)',
-    description: 'Reserved compute, available now',
-    basePrice: 2000000,  // 2.0 USDC
-    minPrice:  1500000,  // 1.5 USDC
-    category: 'compute',
-  },
+// ── Mount API router ─────────────────────────────────────────
+app.use('/api', apiRouter)
+
+// ── x402 Client ──────────────────────────────────────────────
+let x402 = null
+try {
+  x402 = new X402Client({
+    baseUrl:    ADMIN_URL,
+    apiKey:     sellerCreds.apiKey,
+    apiSecret:  sellerCreds.apiSecret,
+    merchantId: sellerCreds.merchantId,
+  })
+  console.log('[seller] ✅ x402 client initialized (direct HTTP)')
+} catch (err) {
+  console.warn('[seller] ⚠️  x402 client failed to init:', err.message)
 }
 
 // Track active negotiations
 const negotiations = new Map()
 
+// ── Seed demo products ───────────────────────────────────────
+seedDemoProducts()
+
 // ── Routes ────────────────────────────────────────────────────
 
-// List all items
+// List all items (backwards-compatible with original demo)
 app.get('/listings', (req, res) => {
+  const products = getAllProducts()
   res.json({
-    seller: '🏪 GoatX402 Marketplace Seller',
-    items: Object.values(LISTINGS).map(item => ({
+    seller: '🏪 Quickash Secondhand Marketplace',
+    items: products.map(item => ({
       ...item,
       basePriceUsdc: item.basePrice / 1e6,
       hint: `POST /negotiate/${item.id} to start haggling`,
@@ -69,7 +67,7 @@ app.get('/listings', (req, res) => {
 
 // Get single item
 app.get('/listings/:id', (req, res) => {
-  const item = LISTINGS[req.params.id]
+  const item = getProduct(req.params.id)
   if (!item) return res.status(404).json({ error: 'Item not found' })
   res.json({ ...item, basePriceUsdc: item.basePrice / 1e6 })
 })
@@ -77,14 +75,9 @@ app.get('/listings/:id', (req, res) => {
 /**
  * Negotiate — buyer proposes a price
  * Body: { offeredPrice: 300000, buyerAgentId: 42, budgetCap: 500000 }
- * 
- * Seller checks:
- * 1. Is the offer above min price?
- * 2. What's the buyer's ERC-8004 reputation?
- * 3. Counter-offer or accept
  */
 app.post('/negotiate/:id', async (req, res) => {
-  const item = LISTINGS[req.params.id]
+  const item = getProduct(req.params.id)
   if (!item) return res.status(404).json({ error: 'Item not found' })
 
   const { offeredPrice, buyerAgentId, budgetCap, useMockReputation } = req.body
@@ -95,7 +88,6 @@ app.post('/negotiate/:id', async (req, res) => {
   // Step 1: Check buyer reputation (ERC-8004)
   let rep
   if (useMockReputation) {
-    // Demo mode — use simulated reputation
     rep = mockReputation(useMockReputation)
     console.log(`[seller] 🔍 Reputation (mock): ${rep.tier} — ${rep.score ?? 'no score'} (${rep.feedbackCount} reviews)`)
   } else if (buyerAgentId != null) {
@@ -112,7 +104,6 @@ app.post('/negotiate/:id', async (req, res) => {
 
   // Step 3: Negotiation logic
   if (offeredPrice < item.minPrice) {
-    // Below walk-away — reject
     console.log(`[seller] ❌ Offer too low (below min ${item.minPrice / 1e6} USDC)`)
     return res.json({
       result: 'rejected',
@@ -123,28 +114,53 @@ app.post('/negotiate/:id', async (req, res) => {
     })
   }
 
-  // Also accept if offer is within 2% of discounted floor
   const closeEnough = offeredPrice >= discountedPrice * 0.98
   if (offeredPrice >= discountedPrice || closeEnough) {
-    // Offer meets or beats discounted price — ACCEPT, create x402 order
     console.log(`[seller] ✅ Offer accepted! Creating x402 payment order...`)
 
     const fromAddress = req.headers['x-from-address'] || '0x0000000000000000000000000000000000000000'
+
+    // Try real x402 order, fall back to mock
     let order
-    try {
-      order = await x402.createOrder({
-        dappOrderId:   `haggle-${item.id}-${Date.now()}`,
-        chainId:       CHAIN_ID,
-        tokenSymbol:   'USDC',
-        tokenContract: USDC,
-        fromAddress,
-        amountWei:     offeredPrice.toString(),
-      })
-    } catch (err) {
-      return res.status(500).json({ error: 'Failed to create payment order', details: err.message })
+    if (x402) {
+      try {
+        order = await x402.createOrder({
+          dappOrderId:   `quickash-${item.id}-${Date.now()}`,
+          chainId:       CHAIN_ID,
+          tokenSymbol:   'USDC',
+          tokenContract: USDC,
+          fromAddress,
+          amountWei:     offeredPrice.toString(),
+        })
+      } catch (err) {
+        console.warn('[seller] x402 order failed:', err.message)
+        order = null
+      }
+    }
+
+    // Mock order if x402 unavailable
+    if (!order) {
+      order = {
+        orderId: `mock-${Date.now()}`,
+        payToAddress: '0x2612567DFf7B6e03340d153F83a7Ca899c0b6299',
+        flow: 'demo',
+      }
     }
 
     negotiations.set(order.orderId, { item, offeredPrice, rep, buyerAgentId })
+
+    // Record the transaction
+    recordTransaction({
+      orderId: order.orderId,
+      productId: item.id,
+      productName: item.name,
+      price: offeredPrice,
+      priceUsdc: offeredPrice / 1e6,
+      buyerRep: rep.tier,
+      discount: rep.discount,
+      timestamp: new Date().toISOString(),
+      status: 'pending_payment',
+    })
 
     const reputationNote = rep.discount > 0
       ? `Since you're a trusted buyer (${rep.tier}), I'll take ${offeredPrice / 1e6} USDC. 🤝`
@@ -155,7 +171,6 @@ app.post('/negotiate/:id', async (req, res) => {
       message:        reputationNote,
       reputationTier: rep.tier,
       discountApplied: rep.discount,
-      // x402 payment details
       orderId:        order.orderId,
       payToAddress:   order.payToAddress,
       amountWei:      offeredPrice,
@@ -166,9 +181,8 @@ app.post('/negotiate/:id', async (req, res) => {
     })
   }
 
-  // Counter-offer — midpoint between offer and discounted price
+  // Counter-offer
   const counterOffer = Math.floor((offeredPrice + discountedPrice) / 2)
-
   const repNote = rep.discount > 0
     ? `I see you have a ${rep.tier} reputation — I can go as low as ${discountedPrice / 1e6} USDC.`
     : `No discount for unknown buyers.`
@@ -176,14 +190,14 @@ app.post('/negotiate/:id', async (req, res) => {
   console.log(`[seller] 🔄 Counter-offer: ${counterOffer / 1e6} USDC`)
 
   return res.json({
-    result:         'counter',
-    message:        `${repNote} How about ${counterOffer / 1e6} USDC?`,
+    result:          'counter',
+    message:         `${repNote} How about ${counterOffer / 1e6} USDC?`,
     counterOffer,
     counterOfferUsdc: counterOffer / 1e6,
-    discountedFloor: discountedPrice,
-    reputationTier:  rep.tier,
-    discountApplied: rep.discount,
-    hint:           `POST /negotiate/${item.id} with offeredPrice: ${counterOffer}`,
+    discountedFloor:  discountedPrice,
+    reputationTier:   rep.tier,
+    discountApplied:  rep.discount,
+    hint:            `POST /negotiate/${item.id} with offeredPrice: ${counterOffer}`,
   })
 })
 
@@ -192,12 +206,30 @@ app.post('/confirm/:orderId', async (req, res) => {
   const neg = negotiations.get(req.params.orderId)
   if (!neg) return res.status(404).json({ error: 'Negotiation not found' })
 
+  // For mock orders, auto-confirm
+  if (req.params.orderId.startsWith('mock-')) {
+    console.log(`[seller] 💸 Payment confirmed (demo)! Delivering "${neg.item.name}"`)
+    negotiations.delete(req.params.orderId)
+    updateProductStatus(neg.item.id, 'sold')
+
+    return res.json({
+      result:    'delivered',
+      item:      neg.item,
+      paidUsdc:  neg.offeredPrice / 1e6,
+      txHash:    '0xdemo_' + Date.now().toString(16),
+      message:   `✅ Here's your "${neg.item.name}". Thanks for the business!`,
+    })
+  }
+
+  if (!x402) return res.status(500).json({ error: 'x402 not available' })
+
   try {
     const status = await x402.getOrderStatus(req.params.orderId)
 
     if (status.status === 'PAYMENT_CONFIRMED' || status.status === 'INVOICED') {
       console.log(`[seller] 💸 Payment confirmed! Delivering "${neg.item.name}"`)
       negotiations.delete(req.params.orderId)
+      updateProductStatus(neg.item.id, 'sold')
 
       return res.json({
         result:    'delivered',
@@ -205,8 +237,6 @@ app.post('/confirm/:orderId', async (req, res) => {
         paidUsdc:  neg.offeredPrice / 1e6,
         txHash:    status.txHash,
         message:   `✅ Here's your "${neg.item.name}". Thanks for the business!`,
-        // In a real app, this is where you'd return the actual asset
-        asset:     { url: `https://assets.goat.network/demo/${neg.item.id}`, expiresIn: '1h' },
       })
     }
 
@@ -216,9 +246,14 @@ app.post('/confirm/:orderId', async (req, res) => {
   }
 })
 
+// ── Start Server ─────────────────────────────────────────────
 app.listen(SELLER_PORT, () => {
-  console.log(`\n🏪 Seller Agent on :${SELLER_PORT}`)
-  console.log(`   GET  /listings        → browse items`)
-  console.log(`   POST /negotiate/:id   → haggle`)
-  console.log(`   POST /confirm/:order  → confirm payment\n`)
+  console.log(`\n${'═'.repeat(55)}`)
+  console.log(`  🏪 Quickash — Secondhand Marketplace`)
+  console.log(`${'═'.repeat(55)}`)
+  console.log(`  🌐 Web UI:    http://localhost:${SELLER_PORT}`)
+  console.log(`  📡 API:       http://localhost:${SELLER_PORT}/api`)
+  console.log(`  📋 Listings:  http://localhost:${SELLER_PORT}/listings`)
+  console.log(`  ⛓️  Chain:     GOAT Testnet3 (${CHAIN_ID})`)
+  console.log(`${'═'.repeat(55)}\n`)
 })
