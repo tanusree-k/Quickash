@@ -591,4 +591,10 @@ function extractProductName(description) {
   return firstSentence.substring(0, 57) + '...'
 }
 
+// ── Error Handler ────────────────────────────────────────────
+router.use((err, req, res, next) => {
+  console.error('[api] ❌ Unhandled error:', err.message)
+  res.status(500).json({ error: 'Internal Server Error', message: err.message })
+})
+
 export default router
